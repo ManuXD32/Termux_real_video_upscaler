@@ -7,6 +7,7 @@ REALCUGANCMD="./realcugan-ncnn"
 
 TMP_DIR="tmp_frames"
 OUT_DIR="out_frames"
+LOG_FILE="upscaling.log"
 
 print_model_info() {
   echo "Available Models and Capabilities:"
@@ -68,14 +69,13 @@ while [[ "$#" -gt 0 ]]; do
   shift
 done
 
-# Validate required arguments
 [[ -z "$INPUT_VIDEO" || -z "$ENGINE" || -z "$MODEL" || -z "$SCALE" || -z "$OUTPUT_NAME" ]] && show_help
 [[ ! -f "$INPUT_VIDEO" ]] && { echo "Video not found: $INPUT_VIDEO"; exit 1; }
 
-# Create folders
 mkdir -p "$TMP_DIR" "$OUT_DIR"
+> "$LOG_FILE"  # Clear log file
 
-# Validate scale for each model
+# Validate scale
 validate_model_scale() {
   case "$MODEL" in
     models-Real-ESRGAN-animevideov3|models-Real-ESRGANv3-anime)
@@ -95,23 +95,53 @@ validate_model_scale() {
       [[ "$SCALE" == "4" ]] || { echo "Model $MODEL supports only scale 4"; exit 1; } ;;
   esac
 }
-
 validate_model_scale
 
-# Get original FPS
 FPS=$(ffmpeg -i "$INPUT_VIDEO" 2>&1 | grep -oP '(\d+(\.\d+)?) fps' | head -n1 | grep -oP '\d+(\.\d+)?')
 [[ -z "$FPS" ]] && FPS=23.98
 
 echo "[1/4] Extracting frames from video..."
 ffmpeg -i "$INPUT_VIDEO" -qscale:v 1 -qmin 1 -qmax 1 -vsync 0 "$TMP_DIR/frame%08d.png"
 
-echo "[2/4] Upscaling frames with $ENGINE..."
+FRAME_TOTAL=$(find "$TMP_DIR" -type f -name '*.png' | wc -l)
+echo "[2/4] Upscaling $FRAME_TOTAL frames with $ENGINE..."
+
+# Start upscaling in background
+START_TIME=$(date +%s)
 if [[ "$ENGINE" == "realsr" ]]; then
-  $REALSRCMD -i "$TMP_DIR" -o "$OUT_DIR" -m models/"$MODEL" -s "$SCALE" -f jpg
+  $REALSRCMD -i "$TMP_DIR" -o "$OUT_DIR" -m models/"$MODEL" -s "$SCALE" -f jpg >> "$LOG_FILE" 2>&1 &
 else
   [[ -z "$DENOISE" ]] && { echo "realcugan requires -n <denoise>"; exit 1; }
-  $REALCUGANCMD -i "$TMP_DIR" -o "$OUT_DIR" -m models/"$MODEL" -s "$SCALE" -n "$DENOISE" -f jpg
+  $REALCUGANCMD -i "$TMP_DIR" -o "$OUT_DIR" -m models/"$MODEL" -s "$SCALE" -n "$DENOISE" -f jpg >> "$LOG_FILE" 2>&1 &
 fi
+
+PID=$!
+
+# Progress and ETA
+PREV_COUNT=0
+PREV_TIME=$START_TIME
+
+while kill -0 $PID 2>/dev/null; do
+  COUNT=$(ls -U "$OUT_DIR"/*.jpg 2>/dev/null | wc -l)
+  CURRENT_TIME=$(date +%s)
+  ELAPSED=$((CURRENT_TIME - START_TIME))
+
+  if (( COUNT > 0 )); then
+    REMAINING=$((FRAME_TOTAL - COUNT))
+    RATE=$(echo "$COUNT / $ELAPSED" | bc -l)
+    ETA=$(echo "$REMAINING / $RATE" | bc -l)
+    ETA_MINS=$(printf "%.0f" "$(echo "$ETA / 60" | bc -l)")
+    ETA_SECS=$(printf "%.0f" "$(echo "$ETA % 60" | bc -l)")
+    PERCENT=$((COUNT * 100 / FRAME_TOTAL))
+    echo -ne "Upscaling: $PERCENT% ($COUNT/$FRAME_TOTAL) | ETA: ${ETA_MINS}m ${ETA_SECS}s\r"
+  else
+    echo -ne "Upscaling: 0% (0/$FRAME_TOTAL) | ETA: --m --s\r"
+  fi
+
+  sleep 1
+done
+
+echo -ne "Upscaling: 100% ($FRAME_TOTAL/$FRAME_TOTAL) | ETA: 0m 0s\n"
 
 echo "[3/4] Rebuilding video..."
 ffmpeg -r "$FPS" -i "$OUT_DIR/frame%08d.jpg" -i "$INPUT_VIDEO" -map 0:v:0 -map 1:a:0 \
@@ -119,5 +149,3 @@ ffmpeg -r "$FPS" -i "$OUT_DIR/frame%08d.jpg" -i "$INPUT_VIDEO" -map 0:v:0 -map 1
 
 echo "[4/4] Cleaning up..."
 rm -rf "$TMP_DIR" "$OUT_DIR"
-
-echo "✅ Done! Output saved as: $OUTPUT_NAME"
